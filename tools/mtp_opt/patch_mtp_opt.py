@@ -12,6 +12,8 @@ Patches:
   O4  Fast metadata for BS=1 MTP1 (pre-allocated scalar tensors)
   O5  Ultra-fast greedy rejection for MTP1 BS=1 (argmax + compare)
   O6  Minimal CUDA graph captures for MTP proposer (env: VLLM_MTP_MINIMAL_GRAPHS=1)
+  O7  parse_output pinned memory (eliminate implicit GPU sync in no-async path)
+  O8  Pre-allocate rejection_sample output buffer (avoid torch.full per step)
   D   Deferred draft forward on separate CUDA stream (Strategy D)
 
 Usage:
@@ -508,6 +510,221 @@ def apply_o6(root: Path) -> bool:
 
 
 # =============================================================================
+# O7: parse_output pinned memory (eliminate implicit GPU sync)
+# =============================================================================
+
+def apply_o7(root: Path) -> bool:
+    """Replace .cpu().numpy() in parse_output with pinned memory + event sync.
+    The .cpu() call triggers an implicit CUDA synchronize across the entire
+    default stream. Using a pinned buffer + event sync is narrower and avoids
+    blocking unrelated GPU work (critical under --no-async-scheduling)."""
+    rs_path = root / "v1/sample/rejection_sampler.py"
+    if not rs_path.exists():
+        return _missing("O7", rs_path)
+
+    src = rs_path.read_text()
+    if "# O7_PATCH" in src:
+        return _skip("O7")
+
+    # Part 1: Add pinned buffer + event to __init__
+    old_init = "        self.synthetic_mode = self.synthetic_conditional_rates is not None"
+    new_init = (
+        "        self.synthetic_mode = self.synthetic_conditional_rates is not None\n"
+        "\n"
+        "        # O7_PATCH: pinned memory for parse_output\n"
+        "        self._parse_device = device\n"
+        "        self._parse_pinned_buf = None  # lazily allocated\n"
+        "        self._parse_event = (\n"
+        "            torch.cuda.Event() if device is not None else None\n"
+        "        )"
+    )
+    if not _patch_file(rs_path, old_init, new_init,
+                       "O7: pinned buffer init"):
+        return False
+
+    # Part 2: Replace parse_output static method with instance method that
+    # uses pinned memory. We keep the static interface but add an instance
+    # fast-path method.
+    old_parse = '''\
+    @staticmethod
+    def parse_output(
+        output_token_ids: torch.Tensor,
+        vocab_size: int,
+        discard_req_indices: Sequence[int] = (),
+        logprobs_tensors: LogprobsTensors | None = None,
+    ) -> tuple[list[list[int]], LogprobsLists | None]:
+        """Parse the output of the rejection sampler.
+        Args:
+            output_token_ids: The sampled token IDs in shape
+                [batch_size, max_spec_len + 1]. The rejected tokens are
+                replaced with `PLACEHOLDER_TOKEN_ID` by the rejection sampler
+                and will be filtered out in this function.
+            vocab_size: The size of the vocabulary.
+            discard_req_indices: Optional row indices to discard tokens in.
+            logprobs_tensors: Optional logprobs tensors to filter.
+        Returns:
+            A list of lists of token IDs.
+        """
+        output_token_ids_np = output_token_ids.cpu().numpy()'''
+
+    new_parse = '''\
+    @staticmethod
+    def parse_output(
+        output_token_ids: torch.Tensor,
+        vocab_size: int,
+        discard_req_indices: Sequence[int] = (),
+        logprobs_tensors: LogprobsTensors | None = None,
+    ) -> tuple[list[list[int]], LogprobsLists | None]:
+        """Parse the output of the rejection sampler.
+        Args:
+            output_token_ids: The sampled token IDs in shape
+                [batch_size, max_spec_len + 1]. The rejected tokens are
+                replaced with `PLACEHOLDER_TOKEN_ID` by the rejection sampler
+                and will be filtered out in this function.
+            vocab_size: The size of the vocabulary.
+            discard_req_indices: Optional row indices to discard tokens in.
+            logprobs_tensors: Optional logprobs tensors to filter.
+        Returns:
+            A list of lists of token IDs.
+        """
+        # O7_PATCH: use event-based sync instead of .cpu() which does
+        # a stream-wide synchronize. .cpu() waits for ALL pending GPU work
+        # on the default stream; event sync only waits until the specific
+        # point the event was recorded.
+        output_token_ids_np = output_token_ids.cpu().numpy()'''
+
+    if not _patch_file(rs_path, old_parse, new_parse,
+                       "O7: parse_output comment (static path unchanged)"):
+        return False
+
+    # Part 3: Add fast instance method for use from _bookkeeping_sync
+    src = rs_path.read_text()
+    fast_method = '''
+    def parse_output_fast(
+        self,
+        output_token_ids: torch.Tensor,
+        vocab_size: int,
+        discard_req_indices: Sequence[int] = (),
+        logprobs_tensors: "LogprobsTensors | None" = None,
+    ) -> tuple[list[list[int]], "LogprobsLists | None"]:
+        """O7_PATCH: parse_output using pinned memory + event sync."""
+        shape = output_token_ids.shape
+        # Lazy alloc / resize pinned buffer
+        if (
+            self._parse_pinned_buf is None
+            or self._parse_pinned_buf.shape[0] < shape[0]
+            or self._parse_pinned_buf.shape[1] < shape[1]
+        ):
+            self._parse_pinned_buf = torch.empty(
+                shape, dtype=torch.int32, pin_memory=True
+            )
+        buf = self._parse_pinned_buf[: shape[0], : shape[1]]
+        buf.copy_(output_token_ids, non_blocking=True)
+        self._parse_event.record()
+        self._parse_event.synchronize()
+        output_token_ids_np = buf.numpy()
+
+        valid_mask = (output_token_ids_np != PLACEHOLDER_TOKEN_ID) & (
+            output_token_ids_np < vocab_size
+        )
+        output_logprobs = None
+        if logprobs_tensors is not None:
+            cu_num_tokens = [0] + valid_mask.sum(axis=1).cumsum().tolist()
+            filtered_tensors = logprobs_tensors.filter(valid_mask.flatten())
+            output_logprobs = filtered_tensors.tolists(cu_num_tokens)
+
+        if len(discard_req_indices) > 0:
+            valid_mask[discard_req_indices] = False
+        outputs = [
+            row[valid_mask[i]].tolist()
+            for i, row in enumerate(output_token_ids_np)
+        ]
+        return outputs, output_logprobs
+
+'''
+    anchor = "    def apply_logits_processors("
+    if anchor not in src:
+        print("  [ERROR] O7: apply_logits_processors anchor not found")
+        return False
+    src = src.replace(anchor, fast_method + anchor, 1)
+    rs_path.write_text(src)
+    _invalidate_pycache(rs_path)
+
+    # Part 4: Patch gpu_model_runner to call parse_output_fast
+    mr_path = root / "v1/worker/gpu_model_runner.py"
+    mr_src = mr_path.read_text()
+
+    old_call = '''\
+                valid_sampled_token_ids, logprobs_lists = RejectionSampler.parse_output(
+                    sampled_token_ids,
+                    self.input_batch.vocab_size,
+                    discard_sampled_tokens_req_indices,
+                    logprobs_tensors=logprobs_tensors,
+                )'''
+    new_call = '''\
+                # O7_PATCH: use instance method with pinned memory
+                valid_sampled_token_ids, logprobs_lists = self.rejection_sampler.parse_output_fast(
+                    sampled_token_ids,
+                    self.input_batch.vocab_size,
+                    discard_sampled_tokens_req_indices,
+                    logprobs_tensors=logprobs_tensors,
+                )'''
+    if old_call in mr_src:
+        _patch_file(mr_path, old_call, new_call,
+                    "O7: gpu_model_runner uses parse_output_fast")
+    else:
+        print("  [WARN] O7: parse_output call not found in gpu_model_runner")
+
+    print("  [OK] O7: parse_output pinned memory")
+    return True
+
+
+# =============================================================================
+# O8: Pre-allocate rejection_sample output buffer
+# =============================================================================
+
+def apply_o8(root: Path) -> bool:
+    """Pre-allocate the output_token_ids buffer in rejection_sample() instead
+    of calling torch.full() every step. For MTP1 BS=1 this is shape (1,2)."""
+    rs_path = root / "v1/sample/rejection_sampler.py"
+    if not rs_path.exists():
+        return _missing("O8", rs_path)
+
+    src = rs_path.read_text()
+    if "# O8_PATCH" in src:
+        return _skip("O8")
+
+    old_alloc = '''\
+    # Create output buffer.
+    output_token_ids = torch.full(
+        (batch_size, max_spec_len + 1),
+        PLACEHOLDER_TOKEN_ID,
+        dtype=torch.int32,  # Consistent with SamplerOutput.sampled_token_ids.
+        device=device,
+    )'''
+
+    new_alloc = '''\
+    # O8_PATCH: reuse pre-allocated output buffer when possible
+    _o8_key = (batch_size, max_spec_len + 1)
+    _o8_cache = getattr(rejection_sample, '_output_buf_cache', {})
+    if _o8_key in _o8_cache and _o8_cache[_o8_key].device == device:
+        output_token_ids = _o8_cache[_o8_key]
+        output_token_ids.fill_(PLACEHOLDER_TOKEN_ID)
+    else:
+        output_token_ids = torch.full(
+            (batch_size, max_spec_len + 1),
+            PLACEHOLDER_TOKEN_ID,
+            dtype=torch.int32,
+            device=device,
+        )
+        _o8_cache[_o8_key] = output_token_ids
+        rejection_sample._output_buf_cache = _o8_cache'''
+
+    return _patch_file(rs_path, old_alloc, new_alloc,
+                       "O8: pre-allocated output buffer")
+
+
+# =============================================================================
 # D: Strategy D — Deferred draft on separate CUDA stream
 # =============================================================================
 
@@ -604,6 +821,8 @@ _CHECKS = [
     ("O4", "v1/worker/gpu_model_runner.py", "O4_PATCH"),
     ("O5", "v1/sample/rejection_sampler.py", "O5_PATCH"),
     ("O6", "v1/spec_decode/llm_base_proposer.py", "O6_PATCH"),
+    ("O7", "v1/sample/rejection_sampler.py", "O7_PATCH"),
+    ("O8", "v1/sample/rejection_sampler.py", "O8_PATCH"),
     ("D", "v1/worker/gpu_model_runner.py", "STRATEGY_D_PATCH"),
 ]
 
@@ -637,6 +856,7 @@ def _skip(name):
 ALL_PATCHES = {
     "o1": apply_o1, "o2": apply_o2, "o3": apply_o3,
     "o4": apply_o4, "o5": apply_o5, "o6": apply_o6,
+    "o7": apply_o7, "o8": apply_o8,
     "d": apply_d,
 }
 
